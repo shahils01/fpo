@@ -324,8 +324,6 @@ class FpoState:
         assert obs_dim == self.env.observation_size
         action_dim = self.env.action_size
 
-        print('self.config.sde_sigma = ', self.config.sde_sigma)
-
         # IMPORTANT: CNF logprob only valid for ODE sampling
         assert self.config.sde_sigma == 0.0, "CNF logprob requires deterministic ODE (sde_sigma=0)."
 
