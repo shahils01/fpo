@@ -36,10 +36,7 @@ class FpoConfig:
 
     # Fixed noise level for sampling via denoising MDP. This is used for
     # DDPO-style policy updates.
-    sde_sigma: jdc.Static[float] = 0.0
-
-    # Use CNF log-prob ratio (PPO-style) instead of CFM / denoising ratios.
-    use_logprob_ratio: jdc.Static[bool] = False
+    sde_sigma: float = 0.0
 
     clipping_epsilon: float = 0.05
 
@@ -93,10 +90,6 @@ class DenoisingMdpActionInfo:
     full_x_t_path: Array  # (*, flow_steps, action_dim)
     initial_log_likelihood: Array  # (*, flow_steps)
 
-@jdc.pytree_dataclass
-class PpoActionInfo:
-    log_prob: Array
-
 
 @jdc.pytree_dataclass
 class FlowSchedule:
@@ -112,7 +105,7 @@ class FpoState:
     """PPO agent state."""
 
     env: jdc.Static[mjp.MjxEnv]
-    config: jdc.Static[FpoConfig]
+    config: FpoConfig
     params: FpoParams
     obs_stats: math_utils.RunningStats
 
@@ -124,9 +117,7 @@ class FpoState:
 
     @staticmethod
     @jdc.jit
-    def init(
-        prng: Array, env: jdc.Static[mjp.MjxEnv], config: jdc.Static[FpoConfig]
-    ) -> FpoState:
+    def init(prng: Array, env: jdc.Static[mjp.MjxEnv], config: FpoConfig) -> FpoState:
         obs_size = env.observation_size
         action_size = env.action_size
         assert isinstance(obs_size, int)
@@ -306,158 +297,9 @@ class FpoState:
         assert all_log_likelihoods.shape == (*batch_dims, flow_steps)
         return all_log_likelihoods
 
-
-    @staticmethod
-    def standard_normal_logprob(x: jnp.ndarray) -> jnp.ndarray:
-        # returns per-sample logprob with last dim treated as event dim
-        d = x.shape[-1]
-        return -0.5 * (jnp.sum(x * x, axis=-1) + d * jnp.log(2.0 * jnp.pi))
-
-    def sample_action_with_logprob(self, obs, prng, deterministic):
-        deterministic = True
-        if self.config.normalize_observations:
-            obs_norm = (obs - self.obs_stats.mean) / self.obs_stats.std
-        else:
-            obs_norm = obs
-
-        (*batch_dims, obs_dim) = obs.shape
-        assert obs_dim == self.env.observation_size
-        action_dim = self.env.action_size
-
-        # IMPORTANT: CNF logprob only valid for ODE sampling
-        assert self.config.sde_sigma == 0.0, "CNF logprob requires deterministic ODE (sde_sigma=0)."
-
-        prng_sample, prng_hutch = jax.random.split(prng, 2)
-
-        # a0 ~ N(0, I): your noisy initial action
-        x_init = jax.random.normal(prng_sample, (*batch_dims, action_dim))
-        logp_init = FpoState.standard_normal_logprob(x_init)  # shape (*batch_dims,)
-
-        schedule = self.get_schedule()
-
-        def flow_field(x_t, t_scalar):
-            # t_scalar is shape (), x_t is (*batch_dims, action_dim)
-            t_embed = jnp.broadcast_to(
-                self.embed_timestep(t_scalar[None]),
-                (*batch_dims, self.config.timestep_embed_dim),
-            )
-            v = networks.flow_mlp_fwd(
-                self.params.policy,
-                obs_norm,
-                x_t,
-                t_embed,
-            ) * self.config.policy_mlp_output_scale
-            return v
-
-        def divergence_hutchinson(x_t, t_scalar, eps):
-            # eps same shape as x_t
-            # compute J(x_t) @ eps via jvp
-            _, jvp_out = jax.jvp(lambda x: flow_field(x, t_scalar), (x_t,), (eps,))
-            # eps^T (J eps), summed over action dim -> shape (*batch_dims,)
-            return jnp.sum(eps * jvp_out, axis=-1)
-
-        def euler_step(carry, inputs):
-            x_t, logp_t, prng_step = carry
-            schedule_t = inputs  # FlowSchedule element
-
-            dt = schedule_t.t_next - schedule_t.t_current
-
-            # velocity f(x,t)
-            v = flow_field(x_t, schedule_t.t_current)
-
-            # Hutchinson noise for trace estimate
-            prng_step, prng_eps = jax.random.split(prng_step)
-            eps = jax.random.normal(prng_eps, x_t.shape)
-
-            div_est = divergence_hutchinson(x_t, schedule_t.t_current, eps)
-
-            # ODE Euler update
-            x_t_next = x_t + dt * v
-
-            # CNF logprob update: logp_next = logp - dt * div(f)
-            logp_next = logp_t - dt * div_est
-
-            return (x_t_next, logp_next, prng_step), (x_t, logp_t, div_est)
-
-        # You need one PRNG per step; easiest is to fold in step index
-        prng_steps = jax.random.split(prng_hutch, self.config.flow_steps)
-
-        (x_final, logp_final, _), aux = jax.lax.scan(
-            euler_step,
-            init=(x_init, logp_init, prng_steps[0]),  # note: see PRNG note below
-            xs=schedule,
-        )
-
-        # If you add feather noise, you must account for it in logprob (it becomes a convolution).
-        # For now: only allow deterministic=True if you want correct CNF logprob.
-        if not deterministic:
-            raise ValueError("Feather noise changes the distribution; CNF logprob no longer matches.")
-
-        # x_final is your denoised action a1, logp_final is log pi(a1|s)
-        return x_final, PpoActionInfo(log_prob=logp_final), logp_final
-
-    def log_prob_of_action(self, obs: Array, action: Array, prng: Array) -> Array:
-        """Compute log pi_theta(action | obs) by integrating the flow backward (t=0 -> t=1)."""
-        assert (
-            self.config.sde_sigma == 0.0
-        ), "CNF logprob only defined for deterministic ODE (sde_sigma=0)."
-
-        if self.config.normalize_observations:
-            obs_norm = (obs - self.obs_stats.mean) / self.obs_stats.std
-        else:
-            obs_norm = obs
-
-        (*batch_dims, action_dim) = action.shape
-        assert action_dim == self.env.action_size
-
-        schedule = self.get_schedule()
-
-        def flow_field(x_t, t_scalar):
-            t_embed = jnp.broadcast_to(
-                self.embed_timestep(t_scalar[None]),
-                (*batch_dims, self.config.timestep_embed_dim),
-            )
-            v = networks.flow_mlp_fwd(
-                self.params.policy,
-                obs_norm,
-                x_t,
-                t_embed,
-            ) * self.config.policy_mlp_output_scale
-            return v
-
-        def divergence_hutchinson(x_t, t_scalar, eps):
-            _, jvp_out = jax.jvp(lambda x: flow_field(x, t_scalar), (x_t,), (eps,))
-            return jnp.sum(eps * jvp_out, axis=-1)
-
-        def backward_step(carry, inputs):
-            x_t, div_accum, prng_step = carry
-            schedule_t = inputs
-            dt = schedule_t.t_next - schedule_t.t_current  # negative
-            dt_rev = -dt
-            prng_step, prng_eps = jax.random.split(prng_step)
-            eps = jax.random.normal(prng_eps, x_t.shape)
-            v = flow_field(x_t, schedule_t.t_current)
-            div_est = divergence_hutchinson(x_t, schedule_t.t_current, eps)
-            x_prev = x_t - dt * v  # reverse Euler
-            div_accum = div_accum + dt_rev * div_est
-            return (x_prev, div_accum, prng_step), None
-
-        prng_steps = jax.random.split(prng, self.config.flow_steps)
-        (x_init, div_integral, _), _ = jax.lax.scan(
-            backward_step,
-            init=(action, jnp.zeros((*batch_dims,)), prng_steps[0]),
-            xs=jax.tree.map(lambda x: jnp.flip(x, axis=0), schedule),
-        )
-
-        logp_init = FpoState.standard_normal_logprob(x_init)
-        logp_action = logp_init + div_integral
-        assert logp_action.shape == (*batch_dims,)
-        return logp_action
-
-
     def sample_action(
         self, obs: Array, prng: Array, deterministic: bool
-    ) -> tuple[Array, FpoActionInfo | DenoisingMdpActionInfo, Array | None]:
+    ) -> tuple[Array, FpoActionInfo | DenoisingMdpActionInfo]:
         """Sample an action from the policy given an observation."""
         if self.config.normalize_observations:
             obs_norm = (obs - self.obs_stats.mean) / self.obs_stats.std
@@ -466,30 +308,6 @@ class FpoState:
 
         (*batch_dims, obs_dim) = obs.shape
         assert obs_dim == self.env.observation_size
-        action_dim = self.env.action_size
-
-        # If we are using the CNF log-prob ratio path, always use the deterministic
-        # sampler that returns a log-prob and fabricate a minimal action_info that
-        # won't be touched in the loss.
-        if self.config.use_logprob_ratio:
-            action, log_prob = self.sample_action_with_logprob(
-                obs, prng, deterministic=True
-            )
-            zeros_eps = jnp.zeros(
-                (*batch_dims, self.config.n_samples_per_action, action_dim)
-            )
-            zeros_t = jnp.zeros(
-                (*batch_dims, self.config.n_samples_per_action, 1)
-            )
-            zeros_cfm = jnp.zeros(
-                (*batch_dims, self.config.n_samples_per_action)
-            )
-            dummy_info = FpoActionInfo(
-                loss_eps=zeros_eps,
-                loss_t=zeros_t,
-                initial_cfm_loss=zeros_cfm,
-            )
-            return action, dummy_info, log_prob
 
         def euler_step(
             carry: Array, inputs: tuple[FlowSchedule, Array]
@@ -564,14 +382,10 @@ class FpoState:
                 t = jax.random.uniform(prng_t, (*sample_shape, 1))
             initial_cfm_loss = self._compute_cfm_loss(obs_norm, x0, eps=eps, t=t)
 
-            return (
-                x0,
-                FpoActionInfo(
-                    loss_eps=eps,
-                    loss_t=t,
-                    initial_cfm_loss=initial_cfm_loss,
-                ),
-                None,
+            return x0, FpoActionInfo(
+                loss_eps=eps,
+                loss_t=t,
+                initial_cfm_loss=initial_cfm_loss,
             )
         else:  # denoising_mdp
             # x_t_path contains states at the START of each Euler step (from scan).
@@ -610,7 +424,7 @@ class FpoState:
             return x0, DenoisingMdpActionInfo(
                 full_x_t_path=full_x_t_path,  # Store only flow_steps states for MDP
                 initial_log_likelihood=initial_log_likelihood,
-            ), None
+            )
 
     @jdc.jit
     def training_step(
@@ -684,6 +498,8 @@ class FpoState:
     def _compute_fpo_loss(
         self, transitions: FpoTransition, prng: Array
     ) -> tuple[Array, dict[str, Array]]:
+        del prng  # Unused for now.
+
         (timesteps, batch_dim) = transitions.reward.shape
         assert transitions.obs.shape == (
             timesteps,
@@ -733,23 +549,8 @@ class FpoState:
                 gae_advantages.std() + 1e-8
             )
 
-        # If enabled, use CNF log-prob ratio (PPO-style).
-        if self.config.use_logprob_ratio:
-            assert transitions.log_prob is not None
-            # Recompute current log-probs under theta for the actions taken in the rollout.
-            new_log_prob = self.log_prob_of_action(
-                transitions.obs,
-                transitions.action,
-                prng=jax.random.fold_in(prng, 0),
-            )
-            assert new_log_prob.shape == transitions.log_prob.shape == (
-                timesteps,
-                batch_dim,
-            )
-            rho_s = jnp.exp(new_log_prob - transitions.log_prob)[..., None]
-
-        # Otherwise fall back to the existing FPO / denoising ratios.
-        elif self.config.loss_mode == "fpo":
+        # Compute policy ratio based on loss mode
+        if self.config.loss_mode == "fpo":
             # Original FPO loss computation
             assert isinstance(transitions.action_info, FpoActionInfo)
 

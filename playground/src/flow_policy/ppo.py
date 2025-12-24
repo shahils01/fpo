@@ -105,7 +105,7 @@ class PpoState:
 
     def sample_action(
         self, obs: Array, prng: Array, deterministic: bool
-    ) -> tuple[Array, PpoActionInfo, Array]:
+    ) -> tuple[Array, PpoActionInfo]:
         """Sample an action from the policy given an observation."""
         if self.config.normalize_observations:
             obs_norm = (obs - self.obs_stats.mean) / self.obs_stats.std
@@ -114,11 +114,12 @@ class PpoState:
         action_dist = networks.gaussian_policy_fwd(self.params.policy, obs_norm)
         if deterministic:
             # Use deterministic action during evaluation.
-            log_probs = jnp.full_like(action_dist.loc[..., 0], jnp.inf)
-            return action_dist.loc, PpoActionInfo(log_prob=log_probs), log_probs
+            return action_dist.loc, PpoActionInfo(
+                log_prob=jnp.full_like(action_dist.loc[:-1], jnp.inf)
+            )
         action = action_dist.sample(prng)
         log_probs = jnp.sum(action_dist.log_prob(action), axis=-1)
-        return action, PpoActionInfo(log_prob=log_probs), log_probs
+        return action, PpoActionInfo(log_prob=log_probs)
 
     @jdc.jit
     def training_step(
