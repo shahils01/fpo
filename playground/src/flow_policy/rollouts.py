@@ -23,6 +23,7 @@ class TransitionStruct[TActionInfo]:
     next_obs: Array  # (*, obs_dim)
     action: Array  # (*, action_dim)
     action_info: TActionInfo
+    log_prob: Array | None  # (*,) or None
     reward: Array  # (*,)
     truncation: Array  # (*,)
     """1 if the environment was truncated, future value is 0."""
@@ -46,8 +47,10 @@ class TransitionStruct[TActionInfo]:
         subseq_length = T * num_envs // subseq_count  # same as unroll_length in brax.
         shuffle_indices = jax.random.permutation(prng, subseq_count)
 
-        def prepare_batch(x: Array) -> Array:
+        def prepare_batch(x: Array | None) -> Array | None:
             """Reshape transitions to add leading (num_batches, unroll_length, batch_size) axes."""
+            if x is None:
+                return None
             suffix = x.shape[2:]
             x = x.swapaxes(0, 1)  # (iters, envs) => (envs, iters)
             x = x.reshape((-1, subseq_length) + suffix)
@@ -65,7 +68,7 @@ class AgentState[TActionInfo](Protocol):
 
     def sample_action(
         self, obs: Array, prng: Array, deterministic: bool
-    ) -> tuple[Array, TActionInfo]: ...
+    ) -> tuple[Array, TActionInfo, Array | None]: ...
 
 
 @jdc.pytree_dataclass
@@ -217,7 +220,7 @@ class BatchedRolloutState:
             # Sample action.
             prng_act, prng_next = jax.random.split(state.prng)
             assert isinstance(state.env_state.obs, Array)
-            action, action_info = agent_state.sample_action(
+            action, action_info, log_prob = agent_state.sample_action_with_logprob(
                 state.env_state.obs, prng_act, deterministic=deterministic
             )
 
@@ -238,6 +241,7 @@ class BatchedRolloutState:
                 next_obs=next_env_state.obs,
                 action=action,
                 action_info=action_info,
+                log_prob=log_prob,
                 reward=next_env_state.reward,
                 truncation=truncation.astype(jnp.float32),
                 discount=discount,
