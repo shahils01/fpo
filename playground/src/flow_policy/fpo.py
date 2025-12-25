@@ -42,6 +42,7 @@ class FpoConfig:
     use_logprob_ratio: jdc.Static[bool] = False
 
     clipping_epsilon: float = 0.05
+    entropy_coeff: float = 0.0
 
     # Based on Brax PPO config:
     batch_size: jdc.Static[int] = 1024
@@ -763,6 +764,8 @@ class FpoState:
         )
         metrics["entropy_flow_trace_mean"] = jnp.mean(divergence_trace)
         metrics["entropy_flow_trace_std"] = jnp.std(divergence_trace)
+        entropy_bonus = self.config.entropy_coeff * jnp.mean(divergence_trace)
+        metrics["entropy_bonus"] = entropy_bonus
 
         # If enabled, use CNF log-prob ratio (PPO-style).
         if self.config.use_logprob_ratio:
@@ -926,6 +929,6 @@ class FpoState:
         metrics["v_loss"] = v_loss
 
         # Compute the total loss that will be used for optimization
-        total_loss = policy_loss + v_loss - self.config.entropy_coeff * jnp.mean(divergence_trace)
+        total_loss = policy_loss + v_loss - entropy_bonus
 
         return total_loss, metrics
