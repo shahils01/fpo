@@ -40,7 +40,7 @@ def main(
     wandb_run = wandb.init(
         entity=wandb_entity,
         project=wandb_project,
-        name=f"fpo_{env_name}_{exp_name}_{timestamp}",
+        name=f"exact_fpo_{env_name}_{exp_name}_{timestamp}",
         config={
             "env_name": env_name,
             "fpo_params": jdc.asdict(config),

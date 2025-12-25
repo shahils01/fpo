@@ -42,7 +42,7 @@ class FpoConfig:
     use_logprob_ratio: jdc.Static[bool] = False
 
     clipping_epsilon: float = 0.05
-    entropy_coeff: float = 0.0
+    entropy_coeff: float = 0.1
 
     # Based on Brax PPO config:
     batch_size: jdc.Static[int] = 1024
