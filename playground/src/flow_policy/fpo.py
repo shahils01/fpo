@@ -454,6 +454,29 @@ class FpoState:
         assert logp_action.shape == (*batch_dims,)
         return logp_action
 
+    def _estimate_divergence_trace(
+        self, obs_norm: Array, x_t: Array, t_scalar: float, prng: Array
+    ) -> Array:
+        """Hutchinson trace estimate of div f(x_t, t) for entropy proxy."""
+        (*batch_dims, _) = x_t.shape
+        t = jnp.broadcast_to(jnp.array(t_scalar), (*batch_dims, 1))
+        t_embed = self.embed_timestep(t)
+
+        def flow_field(x):
+            return (
+                networks.flow_mlp_fwd(
+                    self.params.policy,
+                    obs_norm,
+                    x,
+                    t_embed,
+                )
+                * self.config.policy_mlp_output_scale
+            )
+
+        eps = jax.random.normal(prng, x_t.shape)
+        _, jvp_out = jax.jvp(flow_field, (x_t,), (eps,))
+        return jnp.sum(eps * jvp_out, axis=-1)
+
 
     def sample_action(
         self, obs: Array, prng: Array, deterministic: bool
@@ -733,6 +756,14 @@ class FpoState:
                 gae_advantages.std() + 1e-8
             )
 
+        # Entropy proxy: estimated divergence trace of the flow at t=0.
+        entropy_prng = jax.random.fold_in(prng, 1)
+        divergence_trace = self._estimate_divergence_trace(
+            obs_norm, transitions.action, t_scalar=0.0, prng=entropy_prng
+        )
+        metrics["entropy_flow_trace_mean"] = jnp.mean(divergence_trace)
+        metrics["entropy_flow_trace_std"] = jnp.std(divergence_trace)
+
         # If enabled, use CNF log-prob ratio (PPO-style).
         if self.config.use_logprob_ratio:
             assert transitions.log_prob is not None
@@ -895,6 +926,6 @@ class FpoState:
         metrics["v_loss"] = v_loss
 
         # Compute the total loss that will be used for optimization
-        total_loss = policy_loss + v_loss
+        total_loss = policy_loss + v_loss - self.config.entropy_coeff * jnp.mean(divergence_trace)
 
         return total_loss, metrics
